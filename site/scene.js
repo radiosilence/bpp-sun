@@ -222,7 +222,7 @@ export function createScene(container, world) {
   scene.add(sunLight, sunLight.target, ambient);
   const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(140, 24, 12), new THREE.MeshBasicMaterial({ color: 0xfff1b8, fog: false }));
   scene.add(sunDisc);
-  const SKY = { night: new THREE.Color(0x0b1020), low: new THREE.Color(0xf0b98a), day: new THREE.Color(0x9cc7ec) };
+  const SKY = { night: new THREE.Color(0x0b1020), twilight: new THREE.Color(0x3c4a78), low: new THREE.Color(0xecc4a0), day: new THREE.Color(0x9cc7ec) };
   scene.background = new THREE.Color();
 
   // --- bench markers
@@ -283,7 +283,11 @@ export function createScene(container, world) {
       ambient.intensity = 0.15 + 0.95 * daylight;
       sunDisc.position.copy(dir).multiplyScalar(7000);
       sunDisc.visible = sun.u > -0.02;
-      scene.background.copy(SKY.night).lerp(SKY.low, daylight).lerp(SKY.day, THREE.MathUtils.smoothstep(sun.altitude, 0.02, 0.35));
+      const { smoothstep } = THREE.MathUtils;
+      scene.background.copy(SKY.night)
+        .lerp(SKY.twilight, smoothstep(sun.altitude, -0.22, -0.03))
+        .lerp(SKY.low, smoothstep(sun.altitude, -0.05, 0.05))
+        .lerp(SKY.day, smoothstep(sun.altitude, 0.03, 0.35));
       dirty = true;
     },
 
