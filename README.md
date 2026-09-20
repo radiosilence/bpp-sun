@@ -4,7 +4,7 @@
 
 https://radiosilence.github.io/bpp-sun/
 
-Drag the map, scrub the date and time, and the shadows move. Benches in direct sun glow; the list ranks them by share of daylight spent in sun. Selecting a bench shows its whole year, and *Sit here* drops the camera to eye height facing the way the bench faces, so you can scrub time and see whether the sun is in your eyes. With location allowed, it finds the nearest bench that is sunny now and will stay so for half an hour.
+Drag the map, scrub the date and time, and the shadows move. Benches in direct sun glow; the list ranks them by share of daylight spent in sun. Selecting a bench shows its whole year, and *Sit here* drops the camera to eye height facing the way the bench faces, so you can scrub time and see whether the sun is in your eyes. At a picnic table you can swap sides. With location allowed, it finds the nearest bench that is sunny now and will stay so for half an hour.
 
 ## Why it is built this way
 
@@ -24,6 +24,7 @@ Drag the map, scrub the date and time, and the shadows move. Benches in direct s
 - A ray may pass under canopy for 30m before it is assumed blocked by trunks and understorey. That number is a judgement, not a measurement.
 - Drawn roofs are LIDAR clamped between an estimated eave and the footprint's 90th-percentile height, because overhanging trees otherwise spike them. Wall and roof colours are arbitrary, except the mansion's. This affects the picture only; shadows use the raw surface.
 - In the seated view the sun can appear through a gap in the decorative trees while the bench reads as tree-shaded, or the reverse. The readout is the computed answer; the picture is not.
+- Movable furniture (the mansion terrace, the café) is wherever someone last mapped it. Rather than chase that, **Pin** analyses any tapped spot exactly like a bench; pins live in `localStorage`, not in the data.
 - Bench positions and orientation come from OSM. Unmapped benches don't exist here, and benches without a `direction` tag are drawn facing the nearest path.
 - Direct-beam geometry only: no cloud, no diffuse light.
 - Solar position is the low-precision Meeus series, good to a fraction of a degree.

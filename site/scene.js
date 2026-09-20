@@ -397,7 +397,7 @@ export function createScene(container, world) {
   const markers = new Map();
   const markerGroup = new THREE.Group();
   scene.add(markerGroup);
-  for (const b of world.benches) {
+  const addMarker = (b) => {
     const canvas = document.createElement("canvas");
     canvas.width = canvas.height = 64;
     const tex = new THREE.CanvasTexture(canvas);
@@ -407,8 +407,9 @@ export function createScene(container, world) {
     sprite.renderOrder = 10;
     sprite.userData.id = b.id;
     markerGroup.add(sprite);
-    markers.set(b.id, { sprite, canvas, tex });
-  }
+    markers.set(b.id, { sprite, canvas, tex, pin: b.kind === "spot" });
+  };
+  world.benches.forEach(addMarker);
 
   const dotCanvas = document.createElement("canvas");
   dotCanvas.width = dotCanvas.height = 64;
@@ -426,7 +427,7 @@ export function createScene(container, world) {
   guide.frustumCulled = false;
   scene.add(userDot, guide);
 
-  let dirty = true, flight = null, seat = null;
+  let dirty = true, flight = null, seat = null, placing = false;
   controls.addEventListener("change", () => (dirty = true));
 
   const api = {
@@ -466,7 +467,7 @@ export function createScene(container, world) {
 
     /** Sunlit benches glow in `fill`; shaded ones recede so the eye lands on where the sun is. */
     paintMarker(id, fill, sunlit, selected) {
-      const { canvas, tex, sprite } = markers.get(id);
+      const { canvas, tex, sprite, pin } = markers.get(id);
       const ctx = canvas.getContext("2d");
       ctx.clearRect(0, 0, 64, 64);
       if (sunlit) {
@@ -475,7 +476,11 @@ export function createScene(container, world) {
         halo.addColorStop(1, "rgba(255, 200, 70, 0)");
         ctx.fillStyle = halo; ctx.fillRect(0, 0, 64, 64);
       }
-      ctx.beginPath(); ctx.arc(32, 32, sunlit ? 15 : 11, 0, Math.PI * 2);
+      // Dropped pins are diamonds so they never pass for mapped furniture.
+      const r = sunlit ? 15 : 11;
+      ctx.beginPath();
+      if (pin) { ctx.moveTo(32, 32 - r * 1.25); ctx.lineTo(32 + r * 1.25, 32); ctx.lineTo(32, 32 + r * 1.25); ctx.lineTo(32 - r * 1.25, 32); ctx.closePath(); }
+      else ctx.arc(32, 32, r, 0, Math.PI * 2);
       ctx.fillStyle = sunlit ? fill : "#475063"; ctx.fill();
       ctx.lineWidth = selected ? 6 : 3.5;
       ctx.strokeStyle = selected ? "#5ad1ff" : sunlit ? "#ffffff" : "#15181d";
@@ -509,14 +514,35 @@ export function createScene(container, world) {
       flight = { target: controls.target.clone(), position: controls.target.clone().add(new THREE.Vector3(0, offset.y, flat)) };
     },
 
-    /** Drops the camera to eye height on the bench, facing the way it faces; drag then looks around. */
-    sit(bench) {
+    addMarker,
+
+    removeMarker(id) {
+      const { sprite, tex } = markers.get(id);
+      markerGroup.remove(sprite);
+      tex.dispose();
+      sprite.material.dispose();
+      markers.delete(id);
+      if (seat?.marker === sprite) seat.marker = null;
+      dirty = true;
+    },
+
+    /** While placing, a tap on open ground reports the spot through onGround instead of clearing the selection. */
+    setPlacing(on) {
+      placing = on;
+      renderer.domElement.style.cursor = on ? "crosshair" : "";
+    },
+
+    /**
+     * Drops the camera to eye height on the bench, facing the way it faces; drag then looks around.
+     * At a picnic table you sit on one plank looking across the top, and `flipped` takes the other plank.
+     */
+    sit(bench, flipped) {
       seat ??= { position: camera.position.clone(), target: controls.target.clone() };
       if (seat.marker) seat.marker.visible = true;
       seat.marker = markers.get(bench.id).sprite;
       seat.marker.visible = false;
-      const f = (bench.f * Math.PI) / 180, dir = new THREE.Vector3(Math.sin(f), 0, -Math.cos(f));
-      const eye = toWorld(bench.x, bench.y, groundAt(world, bench.x, bench.y) + 1.2).addScaledVector(dir, 0.15);
+      const f = (bench.f * Math.PI) / 180, dir = new THREE.Vector3(Math.sin(f), 0, -Math.cos(f)).multiplyScalar(flipped ? -1 : 1);
+      const eye = toWorld(bench.x, bench.y, groundAt(world, bench.x, bench.y) + 1.2).addScaledVector(dir, bench.kind === "table" ? -0.75 : 0.15);
       // Orbiting a point 30cm ahead is, near enough, turning your head.
       Object.assign(controls, { minDistance: 0.01, maxPolarAngle: Math.PI * 0.97, enablePan: false, enableZoom: false });
       controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
@@ -528,7 +554,7 @@ export function createScene(container, world) {
 
     stand() {
       if (!seat) return;
-      seat.marker.visible = true;
+      if (seat.marker) seat.marker.visible = true;
       Object.assign(controls, { minDistance: 25, maxPolarAngle: Math.PI * 0.47, enablePan: true, enableZoom: true });
       controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
       controls.touches.ONE = THREE.TOUCH.PAN;
@@ -563,12 +589,26 @@ export function createScene(container, world) {
     raycaster.setFromCamera(pointer, camera);
     return raycaster.intersectObjects(markerGroup.children)[0]?.object.userData.id ?? null;
   };
+  // Marching the pick ray over the height grid is far cheaper than raycasting a million terrain triangles.
+  const groundUnderPointer = () => {
+    const { origin, direction } = raycaster.ray, p = new THREE.Vector3();
+    for (let t = 1; t < 8000; t += t < 300 ? 0.5 : 2) {
+      p.copy(origin).addScaledVector(direction, t);
+      const x = p.x + w / 2, y = h / 2 - p.z;
+      if (x >= 0 && y >= 0 && x < w && y < h && p.y + minH <= groundAt(world, x, y)) return { x, y };
+    }
+    return null;
+  };
   renderer.domElement.addEventListener("pointerdown", (ev) => {
     downAt = [ev.clientX, ev.clientY];
     if (!seat) flight = null;
   });
   renderer.domElement.addEventListener("pointerup", (ev) => {
-    if (downAt && Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) < 6) api.onPick?.(hit(ev));
+    if (downAt && Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) < 6) {
+      const id = hit(ev);
+      if (id === null && placing) api.onGround?.(groundUnderPointer());
+      else api.onPick?.(id);
+    }
     downAt = null;
   });
   renderer.domElement.addEventListener("pointermove", (ev) => {

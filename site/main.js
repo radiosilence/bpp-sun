@@ -33,7 +33,32 @@ world.benches.forEach((b, i) => {
   b.name = `${b.kind === "table" ? "Picnic table" : "Bench"} ${i + 1}`;
   b.z = groundAt(world, b.x, b.y) + SEAT_HEIGHT;
 });
-const benchById = new Map(world.benches.map((b) => [b.id, b]));
+
+// Furniture gets moved and OSM lags, so any spot on the ground can be pinned and analysed like a bench.
+const SPOTS_KEY = "bpp-sun:spots";
+function loadSpots() {
+  try {
+    return JSON.parse(localStorage.getItem(SPOTS_KEY) ?? "[]").filter((p) => p.x >= 0 && p.y >= 0 && p.x < world.w && p.y < world.h);
+  } catch {
+    return [];
+  }
+}
+function saveSpots() {
+  try {
+    localStorage.setItem(SPOTS_KEY, JSON.stringify(places.filter((b) => b.kind === "spot").map(({ id, x, y, n }) => ({ id, x, y, n }))));
+  } catch {
+    // Private browsing: pins just won't outlive the tab.
+  }
+}
+function makeSpot({ id, x, y, n }) {
+  // Invert the pipeline's lon/lat -> metres affine so a pin can still hand off to walking directions.
+  const [[a, b, c], [d, e, f]] = world.geo, det = a * e - b * d;
+  const lon = world.lon + (e * (x - c) - b * (y - f)) / det, lat = world.lat + (a * (y - f) - d * (x - c)) / det;
+  return { id, kind: "spot", n, name: `My spot ${n}`, x, y, z: groundAt(world, x, y) + SEAT_HEIGHT, f: 180, lat, lon };
+}
+const places = [...world.benches, ...loadSpots().map(makeSpot)];
+places.filter((b) => b.kind === "spot").forEach(view.addMarker);
+const benchById = new Map(places.map((b) => [b.id, b]));
 
 const params = new URLSearchParams(location.search);
 const now = londonNow();
@@ -42,7 +67,7 @@ const state = {
   y: py || now.y, m: pm || now.m, d: pd || now.d,
   minutes: params.has("t") ? +params.get("t") : Math.round(now.minutes / STEP) * STEP,
   selected: benchById.has(+params.get("b")) ? +params.get("b") : null,
-  sort: "day", me: null, seated: false,
+  sort: "day", me: null, seated: false, flipped: false, placing: false,
 };
 
 let urlTimer = null;
@@ -54,22 +79,22 @@ const sunsFor = (y, m, d, step) => {
   return Array.from({ length: 1440 / step }, (_, i) => sunVector(world, noon + (i * step - 720) * 60000));
 };
 
+function dayRow(b, suns) {
+  const states = Uint8Array.from(suns, (s) => shadeAt(world, b.x, b.y, b.z, s));
+  return { states, sunMin: states.filter((s) => s === SUN).length * STEP, dayMin: suns.filter((s) => s.u > 0).length * STEP };
+}
+
 function computeDay() {
   const suns = sunsFor(state.y, state.m, state.d, STEP);
   const up = suns.map((s) => s.u > 0);
-  const rows = new Map();
-  for (const b of world.benches) {
-    const states = Uint8Array.from(suns, (s) => shadeAt(world, b.x, b.y, b.z, s));
-    rows.set(b.id, { states, sunMin: states.filter((s) => s === SUN).length * STEP, dayMin: up.filter(Boolean).length * STEP });
-  }
-  day = { suns, rows, rise: up.indexOf(true) * STEP, set: up.lastIndexOf(true) * STEP };
+  day = { suns, rows: new Map(places.map((b) => [b.id, dayRow(b, suns)])), rise: up.indexOf(true) * STEP, set: up.lastIndexOf(true) * STEP };
   buildList();
 }
 
 function buildList() {
   const list = $("list");
   list.replaceChildren();
-  for (const b of world.benches) {
+  for (const b of places) {
     const row = day.rows.get(b.id);
     const li = document.createElement("li");
     li.innerHTML = `<span class="rank"></span><span class="pct"></span><span class="strip"><canvas width="216" height="1"></canvas><b></b></span>`;
@@ -101,12 +126,12 @@ function refresh() {
   view.setSun(sun);
 
   const score = { day: (b) => day.rows.get(b.id).sunMin, rest: (b) => sunFrom(day.rows.get(b.id), state.minutes), near: (b) => -distance(b) }[state.sort];
-  const ordered = [...world.benches].sort((a, b) => score(b) - score(a));
+  const ordered = [...places].sort((a, b) => score(b) - score(a));
   const cursor = `${((state.minutes - STRIP_FROM) / (STRIP_TO - STRIP_FROM)) * 100}%`;
   let sunlitCount = 0;
   ordered.forEach((b, i) => {
     const row = day.rows.get(b.id), sunlit = row.states[step] === SUN, share = row.dayMin ? row.sunMin / row.dayMin : 0;
-    sunlitCount += sunlit;
+    sunlitCount += sunlit && b.kind !== "spot";
     row.rank.textContent = i + 1;
     const sub = state.sort === "near" ? `${Math.round(distance(b))} m` : `${((state.sort === "rest" ? sunFrom(row, state.minutes) : row.sunMin) / 60).toFixed(1)} h`;
     row.pct.innerHTML = `${Math.round(share * 100)}%<i class="now${sunlit ? " on" : ""}"></i><small>${sub}${state.sort === "rest" ? " left" : ""}</small>`;
@@ -157,22 +182,30 @@ function renderDetail() {
     el.innerHTML = `
       <h3></h3><p class="muted" id="d-tags"></p>
       <div class="big" id="d-big"></div><p id="d-now"></p>
-      <p><button id="d-sit" type="button"></button></p>
-      <p><a id="d-walk" target="_blank" rel="noopener">Walking directions</a> · <a id="d-osm" target="_blank" rel="noopener">OpenStreetMap</a> <span class="muted" id="d-dist"></span></p>
+      <p class="row"><button id="d-sit" type="button"></button><button id="d-flip" type="button">⇄ Other side</button><button id="d-remove" type="button">Remove pin</button></p>
+      <p><a id="d-walk" target="_blank" rel="noopener">Walking directions</a><span id="d-osm-wrap"> · <a id="d-osm" target="_blank" rel="noopener">OpenStreetMap</a></span> <span class="muted" id="d-dist"></span></p>
       <div id="year"><div class="hours">${[6, 9, 12, 15, 18, 21].map((h) => `<span style="top:${((h * 60 - STRIP_FROM) / (STRIP_TO - STRIP_FROM)) * 100}%">${h}</span>`).join("")}</div><canvas width="73" height="72"></canvas><b></b></div>
       <div class="months">${"JFMAMJJASOND".split("").map((c) => `<span>${c}</span>`).join("")}</div>
       <p class="muted">Every fifth day of the year against time of day. Click to jump there.</p>`;
     drawYear(b, el.querySelector("canvas"));
     $("d-sit").addEventListener("click", () => {
       state.seated = !state.seated;
-      if (state.seated) view.sit(benchById.get(state.selected));
+      if (state.seated) view.sit(benchById.get(state.selected), state.flipped);
       else view.stand();
       renderDetail();
     });
+    $("d-flip").addEventListener("click", () => {
+      state.flipped = !state.flipped;
+      view.sit(benchById.get(state.selected), state.flipped);
+    });
+    $("d-remove").addEventListener("click", () => removeSpot(state.selected));
     yearFor = b.id;
   }
   el.querySelector("h3").textContent = b.name;
-  $("d-tags").textContent = [tags, b.inscription && `“${b.inscription}”`].filter(Boolean).join(" — ");
+  $("d-tags").textContent = b.kind === "spot" ? "Dropped pin · saved on this device" : [tags, b.inscription && `“${b.inscription}”`].filter(Boolean).join(" — ");
+  $("d-flip").hidden = !(state.seated && b.kind === "table");
+  $("d-osm-wrap").hidden = b.kind === "spot";
+  $("d-remove").hidden = b.kind !== "spot";
   $("d-big").textContent = `${share}% · ${(row.sunMin / 60).toFixed(1)} h of sun`;
   $("d-now").textContent = `At ${hhmm(state.minutes)}: ${STATE_LABEL[current]}${until}.`;
   $("d-sit").textContent = state.seated ? "↑ Stand up" : "Sit here — see the sun from this seat";
@@ -223,15 +256,47 @@ function showTip(text, ev) {
 }
 
 function select(id, fly) {
+  if (id !== state.selected) state.flipped = false;
   state.selected = id;
   if (state.seated && !id) {
     state.seated = false;
     view.stand();
   }
   refresh();
-  if (id && state.seated) view.sit(benchById.get(id));
+  if (id && state.seated) view.sit(benchById.get(id), state.flipped);
   else if (id && fly) view.flyTo(benchById.get(id));
   if (id) $("detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function setPlacing(on) {
+  state.placing = on;
+  view.setPlacing(on);
+  $("pin").setAttribute("aria-pressed", on);
+  notice(on ? "Tap the ground where you want to sit." : "");
+}
+
+function addSpot(point) {
+  if (!point) return notice("That's off the edge of the map — tap inside it.");
+  const n = Math.max(0, ...places.filter((b) => b.kind === "spot").map((b) => b.n)) + 1;
+  const spot = makeSpot({ id: -Date.now(), n, ...point });
+  places.push(spot);
+  benchById.set(spot.id, spot);
+  view.addMarker(spot);
+  day.rows.set(spot.id, dayRow(spot, day.suns));
+  saveSpots();
+  buildList();
+  setPlacing(false);
+  select(spot.id, false);
+}
+
+function removeSpot(id) {
+  places.splice(places.findIndex((b) => b.id === id), 1);
+  benchById.delete(id);
+  day.rows.delete(id);
+  saveSpots();
+  buildList();
+  select(null);
+  view.removeMarker(id);
 }
 
 function setDate(y, m, d) {
@@ -284,6 +349,8 @@ async function findSunny() {
 
 // --- wiring
 view.onPick = (id) => select(id, false);
+view.onGround = addSpot;
+$("pin").addEventListener("click", () => setPlacing(!state.placing));
 view.onHover = (id, ev) => {
   $("view").style.cursor = id ? "pointer" : "";
   if (!id) return showTip(null);

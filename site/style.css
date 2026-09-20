@@ -69,7 +69,10 @@ input[type=range] { width: 100%; accent-color: var(--sun); margin: 0; height: 24
 #detail h3 { margin: 0 0 2px; font-size: 15px; }
 #detail .big { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
 #detail a { color: var(--accent); }
-#d-sit { width: 100%; padding: 8px; }
+#d-sit { flex: 1; padding: 8px; }
+#d-flip { padding: 8px; }
+#d-remove { padding: 8px; }
+#detail [hidden] { display: none; }
 #year { position: relative; margin: 10px 0 0 26px; }
 #year canvas { width: 100%; aspect-ratio: 73 / 40; display: block; image-rendering: pixelated; border-radius: 4px; background: #0e1014; cursor: crosshair; }
 #year b { top: 0; bottom: 0; background: var(--accent); }
