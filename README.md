@@ -4,11 +4,11 @@
 
 https://radiosilence.github.io/bpp-sun/
 
-Drag the map, scrub the date and time, and the shadows move. Benches in direct sun glow; the list ranks them by share of daylight spent in sun. Selecting a bench shows its whole year. With location allowed, it finds the nearest bench that is sunny now and will stay so for half an hour.
+Drag the map, scrub the date and time, and the shadows move. Benches in direct sun glow; the list ranks them by share of daylight spent in sun. Selecting a bench shows its whole year, and *Sit here* drops the camera to eye height facing the way the bench faces, so you can scrub time and see whether the sun is in your eyes. With location allowed, it finds the nearest bench that is sunny now and will stay so for half an hour.
 
 ## Why it is built this way
 
-**Shadows come from LIDAR, not from modelled trees.** The Environment Agency's 1m first-return surface model contains every real crown and roof, so a ray marched across it gives shadows for the trees that exist rather than for cones placed at guessed positions. The tree meshes in the 3D view are decoration, seeded from canopy peaks; they cast nothing.
+**Shadows come from LIDAR, not from modelled trees.** The Environment Agency's 1m first-return surface model contains every real crown and roof, so a ray marched across it gives shadows for the trees that exist rather than for cones placed at guessed positions. Everything you see standing up in the 3D view is decoration and casts nothing: tree meshes are seeded from canopy peaks with crown spread from a watershed of the canopy, and buildings are a Delaunay mesh of each OSM footprint lifted to the LIDAR surface, which is where the roof pitches come from.
 
 **One march, two implementations.** The ground shadows are a GLSL pass over the surface model, rerun when the sun moves. Bench statistics use the same march in JS (`shadeAt`), because 57 benches × 288 five-minute steps is trivial on the CPU and avoids GPU readback. The two must stay in step; both live next to a comment saying so.
 
@@ -16,13 +16,14 @@ Drag the map, scrub the date and time, and the shadows move. Benches in direct s
 
 **Crowns have an underside.** A plain 2.5D surface treats a tree as a solid column to the ground, which wrongly shades every bench beside a trunk at low sun. Each canopy cell carries an estimated crown-base height (40% of the local canopy height), and rays may travel beneath it.
 
-**No build step.** ES modules and an import map; three.js comes from a CDN. `site/` is deployed as-is.
+**No build step.** ES modules and an import map; three.js and delaunator come from a CDN. `site/` is deployed as-is.
 
 ## Known lies
 
 - LIDAR is flown leaf-off. Crowns are morphologically closed to approximate summer leaf, so **winter tree shade is overstated** — most of this canopy is bare from November to March. Tree shade is reported separately from building/terrain shade for that reason.
 - A ray may pass under canopy for 30m before it is assumed blocked by trunks and understorey. That number is a judgement, not a measurement.
-- Building heights are the 90th percentile of LIDAR returns inside the OSM footprint, drawn with flat roofs. This affects the picture only; shadows use the raw surface.
+- Drawn roofs are LIDAR clamped between an estimated eave and the footprint's 90th-percentile height, because overhanging trees otherwise spike them. Wall and roof colours are arbitrary, except the mansion's. This affects the picture only; shadows use the raw surface.
+- In the seated view the sun can appear through a gap in the decorative trees while the bench reads as tree-shaded, or the reverse. The readout is the computed answer; the picture is not.
 - Bench positions and orientation come from OSM. Unmapped benches don't exist here, and benches without a `direction` tag are drawn facing the nearest path.
 - Direct-beam geometry only: no cloud, no diffuse light.
 - Solar position is the low-precision Meeus series, good to a fraction of a degree.

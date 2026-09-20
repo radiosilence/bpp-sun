@@ -42,7 +42,7 @@ const state = {
   y: py || now.y, m: pm || now.m, d: pd || now.d,
   minutes: params.has("t") ? +params.get("t") : Math.round(now.minutes / STEP) * STEP,
   selected: benchById.has(+params.get("b")) ? +params.get("b") : null,
-  sort: "day", me: null,
+  sort: "day", me: null, seated: false,
 };
 
 let urlTimer = null;
@@ -123,7 +123,9 @@ function refresh() {
   $("time").value = state.minutes;
   $("clock").textContent = hhmm(state.minutes);
   const alt = Math.round((sun.altitude * 180) / Math.PI), az = ((sun.azimuth * 180) / Math.PI + 360) % 360;
-  $("readout").textContent = alt > 0 ? `${hhmm(state.minutes)} · sun ${alt}° up in the ${COMPASS[Math.round(az / 22.5) % 16]}` : `${hhmm(state.minutes)} · sun is down`;
+  const chosen = benchById.get(state.selected);
+  $("readout").textContent = (alt > 0 ? `${hhmm(state.minutes)} · sun ${alt}° up in the ${COMPASS[Math.round(az / 22.5) % 16]}` : `${hhmm(state.minutes)} · sun is down`)
+    + (chosen ? `\n${chosen.name} · ${STATE_LABEL[day.rows.get(chosen.id).states[step]]}` : "");
   $("sunfacts").textContent = `Sunrise ≈ ${hhmm(day.rise)} · sunset ≈ ${hhmm(day.set)} · ${sunlitCount} of ${world.benches.length} in sun now`;
 
   renderDetail();
@@ -155,17 +157,25 @@ function renderDetail() {
     el.innerHTML = `
       <h3></h3><p class="muted" id="d-tags"></p>
       <div class="big" id="d-big"></div><p id="d-now"></p>
+      <p><button id="d-sit" type="button"></button></p>
       <p><a id="d-walk" target="_blank" rel="noopener">Walking directions</a> · <a id="d-osm" target="_blank" rel="noopener">OpenStreetMap</a> <span class="muted" id="d-dist"></span></p>
       <div id="year"><div class="hours">${[6, 9, 12, 15, 18, 21].map((h) => `<span style="top:${((h * 60 - STRIP_FROM) / (STRIP_TO - STRIP_FROM)) * 100}%">${h}</span>`).join("")}</div><canvas width="73" height="72"></canvas><b></b></div>
       <div class="months">${"JFMAMJJASOND".split("").map((c) => `<span>${c}</span>`).join("")}</div>
       <p class="muted">Every fifth day of the year against time of day. Click to jump there.</p>`;
     drawYear(b, el.querySelector("canvas"));
+    $("d-sit").addEventListener("click", () => {
+      state.seated = !state.seated;
+      if (state.seated) view.sit(benchById.get(state.selected));
+      else view.stand();
+      renderDetail();
+    });
     yearFor = b.id;
   }
   el.querySelector("h3").textContent = b.name;
   $("d-tags").textContent = [tags, b.inscription && `“${b.inscription}”`].filter(Boolean).join(" — ");
   $("d-big").textContent = `${share}% · ${(row.sunMin / 60).toFixed(1)} h of sun`;
   $("d-now").textContent = `At ${hhmm(state.minutes)}: ${STATE_LABEL[current]}${until}.`;
+  $("d-sit").textContent = state.seated ? "↑ Stand up" : "Sit here — see the sun from this seat";
   $("d-walk").href = `https://www.google.com/maps/dir/?api=1&destination=${b.lat},${b.lon}&travelmode=walking`;
   $("d-osm").href = `https://www.openstreetmap.org/node/${b.id}`;
   $("d-dist").textContent = state.me ? `· ${Math.round(distance(b))} m from you` : "";
@@ -214,8 +224,13 @@ function showTip(text, ev) {
 
 function select(id, fly) {
   state.selected = id;
+  if (state.seated && !id) {
+    state.seated = false;
+    view.stand();
+  }
   refresh();
-  if (id && fly) view.flyTo(benchById.get(id));
+  if (id && state.seated) view.sit(benchById.get(id));
+  else if (id && fly) view.flyTo(benchById.get(id));
   if (id) $("detail").scrollIntoView({ block: "nearest", behavior: "smooth" });
 }
 

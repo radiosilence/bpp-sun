@@ -20,7 +20,7 @@ body {
 #compass span::before { content: "▲"; display: block; font-size: 8px; line-height: 8px; color: #ff6b5e; }
 #readout {
   position: absolute; left: 12px; top: 12px; padding: 6px 10px; border-radius: 8px;
-  background: #14171ccc; font-variant-numeric: tabular-nums; pointer-events: none;
+  background: #14171ccc; font-variant-numeric: tabular-nums; pointer-events: none; white-space: pre-line;
 }
 #tip {
   position: fixed; z-index: 5; padding: 6px 9px; border-radius: 6px; background: #0c0e12f2; border: 1px solid var(--line);
@@ -69,6 +69,7 @@ input[type=range] { width: 100%; accent-color: var(--sun); margin: 0; height: 24
 #detail h3 { margin: 0 0 2px; font-size: 15px; }
 #detail .big { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
 #detail a { color: var(--accent); }
+#d-sit { width: 100%; padding: 8px; }
 #year { position: relative; margin: 10px 0 0 26px; }
 #year canvas { width: 100%; aspect-ratio: 73 / 40; display: block; image-rendering: pixelated; border-radius: 4px; background: #0e1014; cursor: crosshair; }
 #year b { top: 0; bottom: 0; background: var(--accent); }

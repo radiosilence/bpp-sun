@@ -1,9 +1,9 @@
 import * as THREE from "three";
 import { MapControls } from "three/addons/controls/MapControls.js";
 import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+import Delaunator from "delaunator";
 import { groundAt, UNDER_CANOPY_LIMIT } from "./shade.js";
 
-const TERRAIN_STRIDE = 4;
 
 // Same march as shadeAt() in shade.js, run once per ground texel whenever the sun moves.
 const SHADOW_FRAG = /* glsl */ `
@@ -54,8 +54,8 @@ void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
 
 const TERRAIN_VERT = /* glsl */ `
 varying vec2 vUv;
-varying vec3 vNormal;
-void main() { vUv = uv; vNormal = normal; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+varying vec3 vNormal, vPos;
+void main() { vUv = uv; vNormal = normal; vPos = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
 
 const TERRAIN_FRAG = /* glsl */ `
 uniform sampler2D uBase, uShadow;
@@ -63,9 +63,20 @@ uniform vec3 uSunDir, uSunTint;
 uniform float uDaylight;
 uniform vec2 uTexel;
 varying vec2 vUv;
-varying vec3 vNormal;
+varying vec3 vNormal, vPos;
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+}
+
 void main() {
   vec3 base = texture2D(uBase, vUv).rgb;
+  // The basemap is ~0.4m a pixel; from a bench that is a blur, so break it up with grain that fades out with distance.
+  float grain = 0.6 * noise(vPos.xz * 0.7) + 0.4 * noise(vPos.xz * 3.1);
+  base *= 1.0 + (grain - 0.5) * 0.22 * (1.0 - smoothstep(40.0, 260.0, distance(vPos, cameraPosition)));
   // 3x3 tent over the 1m shadow texels; otherwise edges stair-step when the camera is near the ground.
   vec4 s = vec4(0.0);
   for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++) {
@@ -89,8 +100,10 @@ function intTexture(data, w, h, type, internalFormat) {
   return t;
 }
 
-function drawBasemap(world) {
-  const { w, h } = world, size = 2048, k = size / w;
+const AREA_FILL = { garden: "#a9b98e", grass: "#93b96c", meadow: "#a9b76a", pitch: "#84b363", scrub: "#7f9f5e", sand: "#e3d3a0", play: "#cdb98f", parking: "#a5a5a0" };
+
+function drawBasemap(world, size) {
+  const { w, h } = world, k = size / w;
   const mask = document.createElement("canvas");
   mask.width = w; mask.height = h;
   const mctx = mask.getContext("2d"), img = mctx.createImageData(w, h);
@@ -109,7 +122,16 @@ function drawBasemap(world) {
     if (close) ctx.closePath();
   };
   ctx.fillStyle = "#b4b9a6"; ctx.fillRect(0, 0, size, size);
+  const fillAreas = (kinds) => {
+    for (const area of world.areas) {
+      if (!kinds.includes(area.k)) continue;
+      trace(area.p, true); ctx.fillStyle = AREA_FILL[area.k]; ctx.fill();
+      if (area.k === "pitch") { ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 0.35 * k; ctx.stroke(); }
+    }
+  };
+  fillAreas(["garden"]);
   trace(world.park, true); ctx.fillStyle = "#93b96c"; ctx.fill();
+  fillAreas(["grass", "meadow", "scrub", "pitch", "play", "sand", "parking"]);
   ctx.drawImage(mask, 0, 0, size, size);
   ctx.fillStyle = "#6f9fc0";
   for (const poly of world.water) { trace(poly, true); ctx.fill(); }
@@ -124,6 +146,121 @@ function drawBasemap(world) {
   tex.anisotropy = 8;
   return tex;
 }
+
+const WALLS = [0xcdb891, 0xb98a72, 0xded6c6, 0xc9c4b8];
+const ROOFS = [0x6e6f78, 0x96604c, 0x7b5e50];
+
+function inside(x, y, ring) {
+  let hit = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const [xi, yi] = ring[i], [xj, yj] = ring[j];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) hit = !hit;
+  }
+  return hit;
+}
+
+/**
+ * Each footprint is meshed as a Delaunay triangulation of its outline plus a 1m interior grid, lifted to the LIDAR
+ * surface, so pitches, gables and the mansion's hips come out as scanned and edges stay true to the OSM outline.
+ * Display only: shadows never touch these meshes.
+ */
+function buildBuildings(world) {
+  const { w, h, minH, top } = world;
+  const pos = [], col = [], idx = [], color = new THREE.Color();
+  const vertex = (x, y, z) => { pos.push(x - w / 2, z - minH, h / 2 - y); col.push(color.r, color.g, color.b); return pos.length / 3 - 1; };
+  const surface = (x, y) => {
+    const c = Math.min(w - 2, Math.max(1, Math.floor(x))), r = Math.min(h - 2, Math.max(1, h - 1 - Math.floor(y))), around = [];
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) around.push(top[(r + dr) * w + c + dc]);
+    return around.sort((p, q) => p - q)[4] / 100;
+  };
+
+  world.buildings.forEach((b, n) => {
+    const signed = b.p.reduce((acc, [x, y], i) => acc + x * b.p[(i + 1) % b.p.length][1] - b.p[(i + 1) % b.p.length][0] * y, 0);
+    const ring = signed > 0 ? b.p : [...b.p].reverse();
+
+    // Outline resampled at ~1.5m, each point remembering which way is indoors.
+    const edge = [];
+    ring.forEach(([x0, y0], i) => {
+      const [x1, y1] = ring[(i + 1) % ring.length], len = Math.hypot(x1 - x0, y1 - y0), steps = Math.max(1, Math.round(len / 1.5));
+      for (let k = 0; k < steps; k++) edge.push({ x: x0 + ((x1 - x0) * k) / steps, y: y0 + ((y1 - y0) * k) / steps, nx: -(y1 - y0) / len, ny: (x1 - x0) / len });
+    });
+    const clear = (x, y) => ring.every(([x0, y0], i) => {
+      const [x1, y1] = ring[(i + 1) % ring.length], dx = x1 - x0, dy = y1 - y0;
+      const t = Math.min(1, Math.max(0, ((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy || 1)));
+      return Math.hypot(x - x0 - t * dx, y - y0 - t * dy) > 0.75;
+    });
+    const xs = ring.map((p) => p[0]), ys = ring.map((p) => p[1]), grid = [];
+    for (let y = Math.floor(Math.min(...ys)) + 0.5; y < Math.max(...ys); y++)
+      for (let x = Math.floor(Math.min(...xs)) + 0.5; x < Math.max(...xs); x++)
+        if (inside(x, y, ring) && clear(x, y)) grid.push({ x, y, z: surface(x, y) });
+
+    // Overhanging trees put 15m spikes in a house roof; the footprint's 90th percentile is the honest ceiling.
+    const sorted = grid.map((g) => g.z).sort((p, q) => p - q), ceiling = b.z + b.h + 1.5;
+    const eave = sorted.length ? Math.max(b.z + 2.2, Math.min(sorted[Math.floor(sorted.length / 4)], b.z + b.h)) : b.z + b.h;
+    const lift = (z) => Math.min(ceiling, Math.max(eave, z));
+    // LIDAR on the outline itself is half ground, so read the roof a little way indoors.
+    const raw = edge.map((e) => (inside(e.x + e.nx * 1.5, e.y + e.ny * 1.5, ring) ? lift(surface(e.x + e.nx * 1.5, e.y + e.ny * 1.5)) : eave));
+    edge.forEach((e, i) => (e.z = [raw.at(i - 1), raw[i], raw[(i + 1) % raw.length]].sort((p, q) => p - q)[1]));
+    grid.forEach((g) => (g.z = lift(g.z)));
+
+    const landmark = b.name?.includes("Mansion"), wall = landmark ? 0xf4f1e8 : WALLS[n % WALLS.length];
+    const pitched = sorted.length && sorted[Math.floor(sorted.length * 0.9)] - eave > 1.2;
+    color.setHex(landmark ? 0x6e6f78 : pitched ? ROOFS[n % ROOFS.length] : 0x9a9a96);
+    const points = [...edge, ...grid], first = pos.length / 3;
+    points.forEach((p) => vertex(p.x, p.y, p.z));
+    const { triangles } = Delaunator.from(points, (p) => p.x, (p) => p.y);
+    for (let t = 0; t < triangles.length; t += 3) {
+      const [p, q, r] = [points[triangles[t]], points[triangles[t + 1]], points[triangles[t + 2]]];
+      if (!inside((p.x + q.x + r.x) / 3, (p.y + q.y + r.y) / 3, ring)) continue;
+      const up = (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x) > 0;
+      idx.push(first + triangles[t], first + triangles[t + (up ? 1 : 2)], first + triangles[t + (up ? 2 : 1)]);
+    }
+
+    color.setHex(wall);
+    edge.forEach((e, i) => {
+      const f = edge[(i + 1) % edge.length];
+      const v = [vertex(e.x, e.y, b.z - 1), vertex(f.x, f.y, b.z - 1), vertex(f.x, f.y, f.z), vertex(e.x, e.y, e.z)];
+      idx.push(v[0], v[1], v[2], v[0], v[2], v[3]);
+    });
+  });
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+  return new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+}
+
+function label(text) {
+  const canvas = document.createElement("canvas"), ctx = canvas.getContext("2d"), font = "600 28px system-ui, sans-serif";
+  ctx.font = font;
+  canvas.width = Math.ceil(ctx.measureText(text).width) + 16;
+  canvas.height = 40;
+  ctx.font = font; ctx.textBaseline = "middle"; ctx.lineJoin = "round";
+  ctx.lineWidth = 6; ctx.strokeStyle = "rgba(15, 18, 24, 0.85)"; ctx.strokeText(text, 8, 21);
+  ctx.fillStyle = "#ffffff"; ctx.fillText(text, 8, 21);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), depthTest: false, sizeAttenuation: false, transparent: true }));
+  sprite.scale.set((0.028 * canvas.width) / canvas.height, 0.028, 1);
+  sprite.renderOrder = 8;
+  return sprite;
+}
+
+const SKY_VERT = /* glsl */ `
+varying vec3 vDir;
+void main() { vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+
+const SKY_FRAG = /* glsl */ `
+uniform vec3 uZenith, uHorizon, uSunDir, uGlow;
+varying vec3 vDir;
+void main() {
+  vec3 dir = normalize(vDir);
+  vec3 col = mix(uHorizon, uZenith, pow(clamp(dir.y, 0.0, 1.0), 0.5));
+  float toward = max(dot(dir, uSunDir), 0.0);
+  col += uGlow * (0.35 * pow(toward, 12.0) + 0.9 * pow(toward, 220.0));
+  gl_FragColor = vec4(col, 1.0);
+  #include <colorspace_fragment>
+}`;
 
 export function createScene(container, world) {
   const { w, h, minH } = world;
@@ -144,6 +281,7 @@ export function createScene(container, world) {
 
   // --- shadow pass
   const coarse = matchMedia("(pointer: coarse)").matches;
+  const stride = coarse ? 4 : 2;
   const shadowTarget = new THREE.WebGLRenderTarget(coarse ? 1024 : w, coarse ? 1024 : h, { depthBuffer: false });
   const shadowMaterial = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3, vertexShader: QUAD_VERT, fragmentShader: SHADOW_FRAG, depthTest: false,
@@ -159,7 +297,7 @@ export function createScene(container, world) {
   const shadowCamera = new THREE.Camera();
 
   // --- terrain
-  const terrainGeo = new THREE.PlaneGeometry(w, h, w / TERRAIN_STRIDE, h / TERRAIN_STRIDE);
+  const terrainGeo = new THREE.PlaneGeometry(w, h, w / stride, h / stride);
   const pos = terrainGeo.attributes.position;
   for (let i = 0; i < pos.count; i++) pos.setZ(i, groundAt(world, pos.getX(i) + w / 2, pos.getY(i) + h / 2) - minH);
   terrainGeo.rotateX(-Math.PI / 2);
@@ -167,35 +305,56 @@ export function createScene(container, world) {
   const terrainMaterial = new THREE.ShaderMaterial({
     vertexShader: TERRAIN_VERT, fragmentShader: TERRAIN_FRAG,
     uniforms: {
-      uBase: { value: drawBasemap(world) }, uShadow: { value: shadowTarget.texture },
+      uBase: { value: drawBasemap(world, coarse ? 2048 : 4096) }, uShadow: { value: shadowTarget.texture },
       uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uSunTint: { value: new THREE.Color(1, 1, 1) }, uDaylight: { value: 1 }, uTexel: { value: new THREE.Vector2(0.8 / shadowTarget.width, 0.8 / shadowTarget.height) },
     },
   });
   scene.add(new THREE.Mesh(terrainGeo, terrainMaterial));
+  // Past the LIDAR tile the ground dissolves into haze rather than ending at a cliff.
+  const beyondMaterial = new THREE.ShaderMaterial({
+    uniforms: { uHorizon: { value: new THREE.Color() }, uDaylight: { value: 1 } },
+    vertexShader: "varying vec3 vPos; void main() { vPos = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+    fragmentShader: `uniform vec3 uHorizon; uniform float uDaylight; varying vec3 vPos;
+      void main() {
+        gl_FragColor = vec4(mix(vec3(0.36, 0.41, 0.29) * mix(0.12, 1.0, uDaylight), uHorizon, smoothstep(900.0, 4500.0, length(vPos.xz))), 1.0);
+        #include <colorspace_fragment>
+      }`,
+  });
+  const beyond = new THREE.Mesh(new THREE.CircleGeometry(9000, 64).rotateX(-Math.PI / 2), beyondMaterial);
+  beyond.position.y = -1;
+  scene.add(beyond);
 
   // --- buildings
-  const buildingGeos = world.buildings.map((b) => {
-    const shape = new THREE.Shape(b.p.map(([x, y]) => new THREE.Vector2(x - w / 2, y - h / 2)));
-    const geo = new THREE.ExtrudeGeometry(shape, { depth: b.h, bevelEnabled: false });
-    geo.rotateX(-Math.PI / 2);
-    geo.translate(0, b.z - minH, 0);
-    return geo;
-  });
-  scene.add(new THREE.Mesh(mergeGeometries(buildingGeos), new THREE.MeshLambertMaterial({ color: 0xd9d2c5 })));
+  scene.add(buildBuildings(world));
+  for (const b of world.buildings) {
+    if (!b.name) continue;
+    const at = b.p.reduce((acc, [x, y]) => [acc[0] + x / b.p.length, acc[1] + y / b.p.length], [0, 0]);
+    const sprite = label(b.name.replace("Beckenham Place ", ""));
+    sprite.position.copy(toWorld(at[0], at[1], b.z + b.h + 7));
+    scene.add(sprite);
+  }
 
   // --- trees: crowns sized from LIDAR crown-top height
-  const crowns = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshLambertMaterial({ flatShading: true }), world.trees.length);
+  const crowns = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1), new THREE.MeshLambertMaterial({ flatShading: true }), world.trees.length * 2);
   const trunks = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.5, 0.7, 1, 5), new THREE.MeshLambertMaterial({ color: 0x5b4636 }), world.trees.length);
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), tint = new THREE.Color();
-  world.trees.forEach(([x, y, th], i) => {
+  world.trees.forEach(([x, y, th, spread], i) => {
     const base = toWorld(x + 0.5, y + 0.5, groundAt(world, x, y));
-    const r = Math.min(7, Math.max(2, 0.2 * th + 1.2)), crownH = th * 0.62;
-    m.compose(base.clone().setY(base.y + th - crownH / 2), q, new THREE.Vector3(r, crownH / 2, r));
-    crowns.setMatrixAt(i, m);
+    const rnd = (k) => ((x * 73 + y * 151 + k * 37) % 100) / 100;
+    const r = Math.min(9, spread) * 0.9, crownH = th * 0.62;
+    q.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, rnd(1) * Math.PI);
+    m.compose(base.clone().setY(base.y + th - crownH / 2), q, new THREE.Vector3(r * (0.85 + 0.3 * rnd(2)), crownH / 2, r * (0.85 + 0.3 * rnd(3))));
+    crowns.setMatrixAt(i * 2, m);
+    // A second, offset lobe so crowns read as foliage masses rather than balloons.
+    const lobe = new THREE.Vector3((rnd(4) - 0.5) * r, th - crownH * (0.55 + 0.3 * rnd(5)), (rnd(6) - 0.5) * r);
+    m.compose(base.clone().add(lobe), q, new THREE.Vector3(r * 0.68, crownH * 0.36, r * 0.68));
+    crowns.setMatrixAt(i * 2 + 1, m);
+    q.identity();
     m.compose(base.clone().setY(base.y + (th - crownH) / 2), q, new THREE.Vector3(Math.max(0.5, th / 30), th - crownH, Math.max(0.5, th / 30)));
     trunks.setMatrixAt(i, m);
     const jitter = ((x * 73 + y * 151) % 100) / 100;
-    crowns.setColorAt(i, tint.setHSL(0.27 + jitter * 0.06, 0.42, 0.25 + jitter * 0.1));
+    crowns.setColorAt(i * 2, tint.setHSL(0.27 + jitter * 0.06, 0.42, 0.25 + jitter * 0.1));
+    crowns.setColorAt(i * 2 + 1, tint.offsetHSL(0, 0, 0.035));
   });
   scene.add(crowns, trunks);
 
@@ -207,7 +366,7 @@ export function createScene(container, world) {
   };
   for (const [kind, geo] of Object.entries(furniture)) {
     const items = world.benches.filter((b) => b.kind === kind);
-    const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0x7a5a3c }), items.length);
+    const mesh = new THREE.InstancedMesh(geo, new THREE.MeshLambertMaterial({ color: 0xb48e62 }), items.length);
     items.forEach((b, i) => {
       q.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, Math.PI - (b.f * Math.PI) / 180);
       mesh.setMatrixAt(i, m.compose(toWorld(b.x, b.y, groundAt(world, b.x, b.y)), q, new THREE.Vector3(1, 1, 1)));
@@ -220,10 +379,19 @@ export function createScene(container, world) {
   const sunLight = new THREE.DirectionalLight(0xffffff, 2.5);
   const ambient = new THREE.HemisphereLight(0xcfe3ff, 0x6b7a55, 1.1);
   scene.add(sunLight, sunLight.target, ambient);
-  const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(140, 24, 12), new THREE.MeshBasicMaterial({ color: 0xfff1b8, fog: false }));
+  const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(65, 24, 12), new THREE.MeshBasicMaterial({ color: 0xfff1b8, fog: false }));
   scene.add(sunDisc);
-  const SKY = { night: new THREE.Color(0x0b1020), twilight: new THREE.Color(0x3c4a78), low: new THREE.Color(0xecc4a0), day: new THREE.Color(0x9cc7ec) };
-  scene.background = new THREE.Color();
+  const SKY = { night: new THREE.Color(0x0b1020), twilight: new THREE.Color(0x3c4a78), low: new THREE.Color(0xecc4a0), day: new THREE.Color(0x9cc7ec), zenith: new THREE.Color(0x3f7fd0) };
+  const horizon = new THREE.Color(), zenith = new THREE.Color();
+  scene.background = horizon;
+  const skyMaterial = new THREE.ShaderMaterial({
+    vertexShader: SKY_VERT, fragmentShader: SKY_FRAG, side: THREE.BackSide, depthWrite: false,
+    uniforms: { uZenith: { value: zenith }, uHorizon: { value: horizon }, uSunDir: { value: new THREE.Vector3(0, 1, 0) }, uGlow: { value: new THREE.Color() } },
+  });
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(9000, 32, 16), skyMaterial);
+  sky.renderOrder = -1;
+  scene.add(sky);
+  let sunDir = new THREE.Vector3(0, 1, 0);
 
   // --- bench markers
   const markers = new Map();
@@ -258,7 +426,7 @@ export function createScene(container, world) {
   guide.frustumCulled = false;
   scene.add(userDot, guide);
 
-  let dirty = true, flight = null;
+  let dirty = true, flight = null, seat = null;
   controls.addEventListener("change", () => (dirty = true));
 
   const api = {
@@ -281,13 +449,18 @@ export function createScene(container, world) {
       sunLight.intensity = 2.5 * daylight * (sun.u > 0 ? 1 : 0);
       sunLight.color.setRGB(1, 1 - 0.15 * warmth, 1 - 0.35 * warmth);
       ambient.intensity = 0.15 + 0.95 * daylight;
-      sunDisc.position.copy(dir).multiplyScalar(7000);
+      sunDir = dir;
       sunDisc.visible = sun.u > -0.02;
       const { smoothstep } = THREE.MathUtils;
-      scene.background.copy(SKY.night)
+      horizon.copy(SKY.night)
         .lerp(SKY.twilight, smoothstep(sun.altitude, -0.22, -0.03))
         .lerp(SKY.low, smoothstep(sun.altitude, -0.05, 0.05))
         .lerp(SKY.day, smoothstep(sun.altitude, 0.03, 0.35));
+      zenith.copy(SKY.night).lerp(SKY.twilight, smoothstep(sun.altitude, -0.25, -0.05)).lerp(SKY.zenith, smoothstep(sun.altitude, -0.08, 0.3));
+      beyondMaterial.uniforms.uHorizon.value.copy(horizon);
+      beyondMaterial.uniforms.uDaylight.value = daylight;
+      skyMaterial.uniforms.uSunDir.value.copy(dir);
+      skyMaterial.uniforms.uGlow.value.setRGB(1, 0.85 - 0.25 * warmth, 0.6 - 0.35 * warmth).multiplyScalar(daylight);
       dirty = true;
     },
 
@@ -336,6 +509,35 @@ export function createScene(container, world) {
       flight = { target: controls.target.clone(), position: controls.target.clone().add(new THREE.Vector3(0, offset.y, flat)) };
     },
 
+    /** Drops the camera to eye height on the bench, facing the way it faces; drag then looks around. */
+    sit(bench) {
+      seat ??= { position: camera.position.clone(), target: controls.target.clone() };
+      if (seat.marker) seat.marker.visible = true;
+      seat.marker = markers.get(bench.id).sprite;
+      seat.marker.visible = false;
+      const f = (bench.f * Math.PI) / 180, dir = new THREE.Vector3(Math.sin(f), 0, -Math.cos(f));
+      const eye = toWorld(bench.x, bench.y, groundAt(world, bench.x, bench.y) + 1.2).addScaledVector(dir, 0.15);
+      // Orbiting a point 30cm ahead is, near enough, turning your head.
+      Object.assign(controls, { minDistance: 0.01, maxPolarAngle: Math.PI * 0.97, enablePan: false, enableZoom: false });
+      controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+      controls.touches.ONE = THREE.TOUCH.ROTATE;
+      Object.assign(camera, { near: 0.3, fov: 70 });
+      camera.updateProjectionMatrix();
+      flight = { target: eye.clone().addScaledVector(dir, 0.3), position: eye };
+    },
+
+    stand() {
+      if (!seat) return;
+      seat.marker.visible = true;
+      Object.assign(controls, { minDistance: 25, maxPolarAngle: Math.PI * 0.47, enablePan: true, enableZoom: true });
+      controls.mouseButtons.LEFT = THREE.MOUSE.PAN;
+      controls.touches.ONE = THREE.TOUCH.PAN;
+      Object.assign(camera, { near: 2, fov: 45 });
+      camera.updateProjectionMatrix();
+      flight = { target: seat.target, position: seat.position };
+      seat = null;
+    },
+
     flyTo(bench) {
       const target = toWorld(bench.x, bench.y, groundAt(world, bench.x, bench.y));
       const offset = camera.position.clone().sub(controls.target).setLength(160);
@@ -361,7 +563,10 @@ export function createScene(container, world) {
     raycaster.setFromCamera(pointer, camera);
     return raycaster.intersectObjects(markerGroup.children)[0]?.object.userData.id ?? null;
   };
-  renderer.domElement.addEventListener("pointerdown", (ev) => (downAt = [ev.clientX, ev.clientY]));
+  renderer.domElement.addEventListener("pointerdown", (ev) => {
+    downAt = [ev.clientX, ev.clientY];
+    if (!seat) flight = null;
+  });
   renderer.domElement.addEventListener("pointerup", (ev) => {
     if (downAt && Math.hypot(ev.clientX - downAt[0], ev.clientY - downAt[1]) < 6) api.onPick?.(hit(ev));
     downAt = null;
@@ -376,12 +581,18 @@ export function createScene(container, world) {
     if (flight) {
       controls.target.lerp(flight.target, 0.12);
       camera.position.lerp(flight.position, 0.12);
-      if (controls.target.distanceTo(flight.target) < 0.5) flight = null;
+      if (controls.target.distanceTo(flight.target) < 0.02 && camera.position.distanceTo(flight.position) < 0.02) {
+        controls.target.copy(flight.target);
+        camera.position.copy(flight.position);
+        flight = null;
+      }
       dirty = true;
     }
     controls.update();
     if (!dirty) return;
     dirty = false;
+    sky.position.copy(camera.position);
+    sunDisc.position.copy(camera.position).addScaledVector(sunDir, 7000);
     renderer.render(scene, camera);
     api.onCompass?.(controls.getAzimuthalAngle());
   });

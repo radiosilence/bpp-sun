@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy", "scipy", "rasterio", "shapely", "pyproj"]
+# dependencies = ["numpy", "scipy", "scikit-image", "rasterio", "shapely", "pyproj"]
 # ///
 """Builds site/data from EA LIDAR (DSM/DTM 1m) and OSM. Run: uv run pipeline/build.py"""
 
@@ -15,6 +15,7 @@ import rasterio
 from pyproj import Transformer
 from rasterio import features
 from scipy import ndimage as ndi
+from skimage.segmentation import watershed
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
@@ -33,10 +34,13 @@ LIDAR = {
     "dsm": ("lidar-composite-digital-surface-model-first-return-dsm-1m", "df4e3ec3-315e-48aa-aaaf-b5ae74d7b2bb__Lidar_Composite_Elevation_FZ_DSM_1m"),
     "dtm": ("lidar-composite-digital-terrain-model-dtm-1m", "13787b9a-26a4-4775-8523-806d13af58fc__Lidar_Composite_Elevation_DTM_1m"),
 }
-OVERPASS = "https://overpass-api.de/api/interpreter"
+OVERPASS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter", "https://overpass.kumi.systems/api/interpreter"]
 OSM_QUERY = """[out:json][timeout:90][bbox:51.410,-0.027,51.434,-0.001];
 (nwr["amenity"="bench"];nwr["leisure"="picnic_table"];nwr["natural"="water"];nwr["leisure"="park"];
-way["building"];relation["building"];way["highway"];way["railway"="rail"];);out body geom;"""
+way["building"];relation["building"];way["highway"];way["railway"="rail"];
+nwr["leisure"~"^(pitch|playground|garden)$"];nwr["amenity"="parking"];nwr["natural"~"^(scrub|sand|beach|grassland|heath)$"];nwr["landuse"~"^(meadow|grass)$"];);out body geom;"""
+AREA_KINDS = {"pitch": "pitch", "playground": "play", "garden": "garden", "parking": "parking", "scrub": "scrub", "heath": "scrub",
+              "sand": "sand", "beach": "sand", "grassland": "meadow", "meadow": "meadow", "grass": "grass"}
 
 to_bng = Transformer.from_crs(4326, 27700, always_xy=True)
 
@@ -96,13 +100,23 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for name, (slug, cov) in LIDAR.items():
         fetch(WCS.format(slug=slug, cov=cov, e0=E0, e1=E1, n0=N0, n1=N1), RAW / f"{name}.tif")
-    fetch(OVERPASS, RAW / "osm.json", data=urllib.parse.urlencode({"data": OSM_QUERY}).encode())
+    for i, endpoint in enumerate(OVERPASS):
+        try:
+            fetch(endpoint, RAW / "osm.json", data=urllib.parse.urlencode({"data": OSM_QUERY}).encode())
+            break
+        except OSError as err:
+            print(f"  {endpoint}: {err}")
+            if i == len(OVERPASS) - 1:
+                raise
 
     dsm = rasterio.open(RAW / "dsm.tif").read(1).astype(np.float32)
     dtm = rasterio.open(RAW / "dtm.tif").read(1).astype(np.float32)
     assert dsm.shape == (H, W) and dsm.min() > -100 and dtm.min() > -100
     osm = json.loads((RAW / "osm.json").read_text())["elements"]
     domain = box(0, 0, W, H)
+
+    park = unary_union([p for el in osm if el["type"] == "way" and el["id"] == PARK_WAY for p in polygons(el)])
+    near_park = park.buffer(25)
 
     # --- buildings: OSM footprints, LIDAR heights
     chm = np.maximum(dsm - dtm, 0)
@@ -116,7 +130,10 @@ def main():
             m = rc(p)
             bmask |= m
             h = float(np.percentile(chm[m], 90))
-            buildings.append({"p": coords(p.exterior.coords[:-1]), "h": round(max(h, 2.5), 1), "z": round(float(dtm[m].min()), 1)})
+            b = {"p": coords(p.exterior.coords[:-1]), "h": round(max(h, 2.5), 1), "z": round(float(dtm[m].min()), 1)}
+            if "name" in el["tags"] and park.buffer(5).contains(p.centroid):
+                b["name"] = el["tags"]["name"]
+            buildings.append(b)
     bmask = ndi.binary_dilation(bmask, iterations=1)
 
     # --- canopy: LIDAR is flown leaf-off, so crowns are porous; close the holes for a leaf-on surface.
@@ -136,7 +153,13 @@ def main():
     sm = ndi.gaussian_filter(np.where(tree, closed, 0), 1.5)
     peaks = (sm == ndi.maximum_filter(sm, size=9)) & (sm >= 5)
     rows, cols = np.nonzero(peaks)
-    trees = [[int(c), int(H - 1 - r), round(float(sm[r, c]), 1)] for r, c in zip(rows, cols)]
+    # Crown spread from a watershed of the canopy around each peak, so an oak and a birch don't draw alike.
+    markers = np.zeros((H, W), np.int32)
+    markers[rows, cols] = np.arange(1, len(rows) + 1)
+    crowns = watershed(-sm, markers, mask=tree & (sm >= 2))
+    area = np.bincount(crowns.ravel(), minlength=len(rows) + 1)[1:]
+    radius = np.clip(np.sqrt(area / np.pi), 1.5, 11)
+    trees = [[int(c), int(H - 1 - r), round(float(sm[r, c]), 1), round(float(rad), 1)] for r, c, rad in zip(rows, cols, radius)]
 
     # --- park, benches, basemap vectors
     walkable = [LineString(local(el["geometry"])) for el in osm if el["type"] == "way" and "highway" in el.get("tags", {}) and "geometry" in el]
@@ -156,8 +179,6 @@ def main():
         near = line.interpolate(line.project(pt))
         return float(np.degrees(np.arctan2(near.x - x, near.y - y)) % 360)
 
-    park = unary_union([p for el in osm if el["type"] == "way" and el["id"] == PARK_WAY for p in polygons(el)])
-    near_park = park.buffer(25)
     benches = []
     for el in osm:
         t = el.get("tags", {})
@@ -171,6 +192,12 @@ def main():
                         **{k: t[k] for k in ("backrest", "material", "seats", "inscription") if k in t}})
 
     water = [coords(p.exterior.coords[:-1]) for el in osm if el.get("tags", {}).get("natural") == "water" for p in polygons(el) if p.intersects(domain)]
+    areas = []
+    for el in osm:
+        t = el.get("tags", {})
+        kind = AREA_KINDS.get(t.get("leisure") or t.get("amenity") or t.get("natural") or t.get("landuse"))
+        if kind and "building" not in t:
+            areas += [{"k": kind, "p": coords(p.exterior.coords[:-1])} for p in polygons(el) if p.intersects(domain)]
     PATHS = {"footway", "path", "cycleway", "track", "steps", "pedestrian", "bridleway"}
     lines = []
     for el in osm:
@@ -204,7 +231,7 @@ def main():
     scene = {"w": W, "h": H, "origin": [E0, N0], "lat": lat, "lon": lon, "convergence": convergence, "geo": geo,
              "minH": float(dtm.min()), "maxH": float(top.max()),
              "park": coords(park.exterior.coords[:-1]), "benches": benches, "buildings": buildings,
-             "trees": trees, "water": water, "lines": lines}
+             "trees": trees, "water": water, "areas": areas, "lines": lines}
     (OUT / "scene.json").write_text(json.dumps(scene, separators=(",", ":")))
     print(f"{len(benches)} benches, {len(buildings)} buildings, {len(trees)} trees, convergence {convergence:.2f}°")
     for f in sorted(OUT.iterdir()):
