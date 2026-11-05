@@ -76,7 +76,7 @@
   <footer>
     <details>
       <summary>How this works, and where it lies</summary>
-      <p>Shadows are ray-marched against the Environment Agency's 1m first-return LIDAR surface, so trees and buildings are the real scanned shapes. Bench positions, footprints and paths are from OpenStreetMap. A bench is sampled 1m above the ground every five minutes; the percentage is the share of daylight spent in direct sun.</p>
+      <p>Shadows are ray-marched against the Environment Agency's 1m first-return LIDAR surface, so trees and buildings are the real scanned shapes. Bench positions, footprints and paths are from OpenStreetMap. A bench is sampled 1m above the ground every five minutes; the percentage is the share of daylight spent in sun, with time in tree shade counted as half, since canopy lets dappled light through.</p>
       <p>LIDAR is flown in winter, so crowns are filled in to approximate summer leaf. Tree shade is therefore pessimistic from November to March, when most of this canopy is bare. Rays may pass under a crown for up to 30m before trunks and undergrowth are assumed to block them. Cloud is not modelled. Benches missing from OpenStreetMap are missing here, and movable furniture is wherever it was last mapped — drop a pin on the real spot instead.</p>
     </details>
     <p class="muted">Contains public sector information licensed under the Open Government Licence v3.0 © Environment Agency. Map data © OpenStreetMap contributors (ODbL).</p>

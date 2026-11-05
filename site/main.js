@@ -6,6 +6,9 @@ const STEP = 5, STEPS = 1440 / STEP;
 const STRIP_FROM = 4 * 60, STRIP_TO = 22 * 60;
 const YEAR_DAYS = 5, YEAR_STEP = 15;
 const STATE_COLOR = { [SUN]: "#f6bd3c", [TREE_SHADE]: "#4d7a5c", [SOLID_SHADE]: "#56607a" };
+// Canopy is dappled and lets some sun through, so tree shade counts as half sun.
+const LIGHT = { [SUN]: 1, [TREE_SHADE]: 0.5 };
+const sunMinutes = (states) => states.reduce((a, s) => a + (LIGHT[s] || 0), 0) * STEP;
 const STATE_LABEL = { [SUN]: "in direct sun", [TREE_SHADE]: "in tree shade", [SOLID_SHADE]: "shaded by a building or the hill", [NIGHT]: "after dark" };
 const $ = (id) => document.getElementById(id);
 const pad = (n) => String(n).padStart(2, "0");
@@ -81,7 +84,7 @@ const sunsFor = (y, m, d, step) => {
 
 function dayRow(b, suns) {
   const states = Uint8Array.from(suns, (s) => shadeAt(world, b.x, b.y, b.z, s));
-  return { states, sunMin: states.filter((s) => s === SUN).length * STEP, dayMin: suns.filter((s) => s.u > 0).length * STEP };
+  return { states, sunMin: sunMinutes(states), dayMin: suns.filter((s) => s.u > 0).length * STEP };
 }
 
 function computeDay() {
@@ -118,7 +121,7 @@ function buildList() {
   }
 }
 
-const sunFrom = (row, from) => row.states.subarray(from / STEP).filter((s) => s === SUN).length * STEP;
+const sunFrom = (row, from) => sunMinutes(row.states.subarray(from / STEP));
 const distance = (b) => (state.me ? Math.hypot(b.x - state.me.x, b.y - state.me.y) : Infinity);
 
 function refresh() {
